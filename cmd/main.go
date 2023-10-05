@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/boltdb/bolt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -19,12 +19,6 @@ const (
 	APISignatureKey = "" // Your API request signing key from the Call Password section.
 	Timeout         = 60 // Value in seconds for call verification. Possible values: min 30, max 120, default 60.
 )
-
-type RequestBody struct {
-	ClientNumber string `json:"clientNumber"`
-	CallbackLink string `json:"callbackLink"`
-	Timeout      int    `json:"timeout"`
-}
 
 type Response struct {
 	Status string `json:"status"`
@@ -54,14 +48,13 @@ type CallbackResponse struct {
 	CallId string `json:"callId"`
 }
 
-func getAuthToken(requestMethod string, time int64, accessKey string, params string, signatureKey string) string {
+func getAuthToken(requestMethod, accessKey, params, signatureKey string, time int64) string {
 	hash := strings.Join([]string{requestMethod, strconv.FormatInt(time, 10), accessKey, params, signatureKey}, "\n")
 	return accessKey + strconv.FormatInt(time, 10) + fmt.Sprintf("%x", sha256.Sum256([]byte(hash)))
 }
 
 func main() {
-
-	// Open the my.db data file in your current directory.
+	// Open my.db data file in your current directory.
 	// It will be created if it doesn't exist.
 	db, err := bolt.Open("my.db", 0600, nil)
 	if err != nil {
@@ -76,102 +69,102 @@ func main() {
 			switch r.FormValue("action") {
 			case "start":
 				// Start the call verification process.
-				requestBody := RequestBody{
-					ClientNumber: r.FormValue("phoneNumber"),
-					CallbackLink: fmt.Sprintf("http://%s/?action=callback", r.Host),
-					Timeout:      Timeout,
+				body, err := json.Marshal(map[string]interface{}{
+					"clientNumber": r.FormValue("phoneNumber"),
+					"callbackLink": "http://" + r.Host + "/?action=callback",
+					"timeout":      Timeout,
+				})
+				if err != nil {
+					log.Fatal(err)
 				}
 
-				requestJSON, _ := json.Marshal(requestBody)
-
-				token := getAuthToken("call-verification/start-inbound-call-waiting", time.Now().Unix(), APIAccessKey, string(requestJSON), APISignatureKey)
+				token := getAuthToken("call-verification/start-inbound-call-waiting", APIAccessKey, string(body), APISignatureKey, time.Now().Unix())
 				client := &http.Client{}
 
-				req, _ := http.NewRequest("POST", "https://api.new-tel.net/call-verification/start-inbound-call-waiting", bytes.NewBuffer(requestJSON))
+				req, err := http.NewRequest(http.MethodPost, "https://api.new-tel.net/call-verification/start-inbound-call-waiting", bytes.NewBuffer(body))
 
 				req.Header.Set("Authorization", "Bearer "+token)
 				req.Header.Set("Content-Type", "application/json")
 
-				resp, _ := client.Do(req)
+				resp, err := client.Do(req)
+				respBody, err := io.ReadAll(resp.Body)
 
-				defer resp.Body.Close()
+				var decodedResp Response
+				err = json.Unmarshal(respBody, &decodedResp)
 
-				responseBody, _ := ioutil.ReadAll(resp.Body)
+				if decodedResp.Status == "success" {
+					callDetailsJSON, err := json.Marshal(decodedResp.Data.CallDetails)
+					if err != nil {
+						log.Fatal(err)
+					}
 
-				var decodedResponse Response
-				_ = json.Unmarshal(responseBody, &decodedResponse)
-
-				if decodedResponse.Status == "success" {
-					callDetailsJSON, _ := json.Marshal(decodedResponse.Data.CallDetails)
-
-					data, _ := json.Marshal(map[string]interface{}{
+					data, err := json.Marshal(map[string]interface{}{
 						"timestamp": time.Now().Add(time.Duration(Timeout) * time.Second).Unix(),
 						"flag":      false,
 					})
 
-					_ = db.Update(func(tx *bolt.Tx) error {
-						bucket, _ := tx.CreateBucketIfNotExists([]byte("mybucket"))
-						_ = bucket.Put([]byte(decodedResponse.Data.CallDetails.CallID), data)
-
-						return nil
+					err = db.Update(func(tx *bolt.Tx) error {
+						bucket, err := tx.CreateBucketIfNotExists([]byte("myBucket"))
+						err = bucket.Put([]byte(decodedResp.Data.CallDetails.CallID), data)
+						return err
 					})
 
 					w.Header().Set("Content-Type", "application/json")
 
-					_, _ = w.Write(callDetailsJSON)
+					_, err = w.Write(callDetailsJSON)
 				}
 			case "check":
 				// Check the call confirmation status.
-				_ = db.View(func(tx *bolt.Tx) error {
-
-					bucket := tx.Bucket([]byte("mybucket"))
+				err = db.View(func(tx *bolt.Tx) error {
+					bucket := tx.Bucket([]byte("myBucket"))
 					value := bucket.Get([]byte(r.FormValue("callId")))
 
 					var data Data
-					_ = json.Unmarshal(value, &data)
-					_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					err = json.Unmarshal(value, &data)
+					err = json.NewEncoder(w).Encode(map[string]interface{}{
 						"timeout": data.Timestamp - time.Now().Unix(),
 						"flag":    data.Flag,
 					})
 
-					return nil
+					return err
 				})
 			case "callback":
 				// Process callback from call verification.
 				var timestamp int64
 
-				body, _ := ioutil.ReadAll(r.Body)
-				defer r.Body.Close()
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					log.Fatal(err)
+				}
 
 				var jsonData CallbackResponse
-				_ = json.Unmarshal(body, &jsonData)
-				_ = db.View(func(tx *bolt.Tx) error {
-					bucket := tx.Bucket([]byte("mybucket"))
+				err = json.Unmarshal(body, &jsonData)
+				err = db.View(func(tx *bolt.Tx) error {
+					bucket := tx.Bucket([]byte("myBucket"))
 					value := bucket.Get([]byte(jsonData.CallId))
 
 					var data Data
-					_ = json.Unmarshal(value, &data)
+					err = json.Unmarshal(value, &data)
 					timestamp = data.Timestamp
 
-					return nil
+					return err
 				})
 
-				callbackData, _ := json.Marshal(map[string]interface{}{
+				callbackData, err := json.Marshal(map[string]interface{}{
 					"timestamp": timestamp,
 					"flag":      true,
 				})
 
-				_ = db.Update(func(tx *bolt.Tx) error {
-					bucket, _ := tx.CreateBucketIfNotExists([]byte("mybucket"))
-					_ = bucket.Put([]byte(jsonData.CallId), callbackData)
-					return nil
+				err = db.Update(func(tx *bolt.Tx) error {
+					bucket, err := tx.CreateBucketIfNotExists([]byte("myBucket"))
+					err = bucket.Put([]byte(jsonData.CallId), callbackData)
+					return err
 				})
 			}
 		}
 	})
 
-	err = http.ListenAndServe(":8080", nil)
-	if err != nil {
+	if err := http.ListenAndServe(":8080", nil); err != nil {
 		log.Fatal(err)
 	}
 }
